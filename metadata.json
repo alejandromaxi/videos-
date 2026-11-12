@@ -1,0 +1,6 @@
+{
+  "name": "POWER PAPILO",
+  "description": "Descargador nativo de audio y video de alto rendimiento con presets, soporte de extracción de audio MP3/M4A, cola de descargas y servicio en segundo plano.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
