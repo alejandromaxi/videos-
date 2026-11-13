@@ -1,6 +1,7 @@
 package com.example.ui
 
 import android.content.Context
+import android.net.Uri
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -14,6 +15,7 @@ import com.example.download.YtDlpEngine
 import com.example.util.CookieHelper
 import com.example.util.FileUtils
 import com.example.util.FolderOption
+import com.example.util.StorageVolumeUi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -22,7 +24,6 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
-import java.io.File
 import java.util.regex.Pattern
 
 data class SampleMedia(
@@ -150,8 +151,31 @@ class HomeViewModel : ViewModel() {
     fun setDestinationFolder(context: Context, path: String): Boolean {
         val success = FileUtils.setDownloadDirectory(context, path)
         if (success) {
-            _currentDownloadDir.value = FileUtils.getDownloadDirectory(context).absolutePath
-            refreshLibrary(context)
+            _currentDownloadDir.value = FileUtils.getCurrentDestinationLabel(context)
+            refreshLibrary(context, clearPreviousCompleted = true)
+        }
+        return success
+    }
+
+    fun setPublicDownloadsFolder(context: Context): Boolean {
+        val success = FileUtils.setPublicDownloadsDestination(context)
+        if (success) {
+            _currentDownloadDir.value = FileUtils.getCurrentDestinationLabel(context)
+            refreshLibrary(context, clearPreviousCompleted = true)
+        }
+        return success
+    }
+
+    fun setSafTreeFolder(
+        context: Context,
+        treeUri: Uri,
+        subfolderDocId: String? = null,
+        customDisplayPath: String? = null
+    ): Boolean {
+        val success = FileUtils.setSafTreeDestination(context, treeUri, subfolderDocId, customDisplayPath)
+        if (success) {
+            _currentDownloadDir.value = FileUtils.getCurrentDestinationLabel(context)
+            refreshLibrary(context, clearPreviousCompleted = true)
         }
         return success
     }
@@ -159,8 +183,8 @@ class HomeViewModel : ViewModel() {
     fun createCustomDestinationFolder(context: Context, folderName: String): Boolean {
         val newFolder = FileUtils.createCustomFolder(context, folderName)
         if (newFolder != null) {
-            _currentDownloadDir.value = newFolder.absolutePath
-            refreshLibrary(context)
+            _currentDownloadDir.value = FileUtils.getCurrentDestinationLabel(context)
+            refreshLibrary(context, clearPreviousCompleted = true)
             return true
         }
         return false
@@ -170,7 +194,11 @@ class HomeViewModel : ViewModel() {
         return FileUtils.getFolderOptions(context)
     }
 
-    // --- Modo 1: Individual ---
+    fun getStorageVolumes(context: Context): List<StorageVolumeUi> {
+        return FileUtils.getStorageVolumesForPicker(context)
+    }
+
+    // --- Modo 1: Individual (NUNCA descarga como playlist) ---
 
     fun onUrlChange(newUrl: String) {
         _urlInput.value = newUrl
@@ -178,16 +206,17 @@ class HomeViewModel : ViewModel() {
         if (newUrl.isBlank()) {
             _previewInfo.value = null
         } else if (YtDlpEngine.isYouTubeUrl(newUrl)) {
-            val videoId = YtDlpEngine.extractYouTubeId(newUrl)
+            val singleUrl = YtDlpEngine.sanitizeSingleVideoUrl(newUrl)
+            val videoId = YtDlpEngine.extractYouTubeId(singleUrl)
             val thumb = if (videoId != null) "https://i.ytimg.com/vi/$videoId/hqdefault.jpg" else null
             _previewInfo.value = VideoInfoPreview(
-                url = newUrl.trim(),
-                title = if (videoId != null) "Video de YouTube ($videoId)" else "Video de YouTube",
+                url = singleUrl,
+                title = if (videoId != null) "Video de YouTube ($videoId)" else "Video Individual de YouTube",
                 uploader = "YouTube",
                 durationSeconds = 0L,
                 thumbnailUrl = thumb,
                 viewCount = null,
-                webpageUrl = newUrl.trim(),
+                webpageUrl = singleUrl,
                 isPlaylist = false
             )
         }
@@ -200,7 +229,8 @@ class HomeViewModel : ViewModel() {
     fun onPasteClicked(context: Context, rawText: String) {
         val extractedUrl = extractUrl(rawText) ?: rawText.trim()
         if (extractedUrl.isBlank()) return
-        onUrlChange(extractedUrl)
+        val singleUrl = YtDlpEngine.sanitizeSingleVideoUrl(extractedUrl)
+        onUrlChange(singleUrl)
         analyzeUrl(context)
     }
 
@@ -222,23 +252,28 @@ class HomeViewModel : ViewModel() {
             _isAnalyzing.value = true
             _analysisError.value = null
             try {
-                val url = YtDlpEngine.resolveRedirectUrl(rawUrl)
+                val sanitized = YtDlpEngine.sanitizeSingleVideoUrl(rawUrl)
+                val url = YtDlpEngine.resolveRedirectUrl(sanitized)
                 if (url != rawUrl) {
                     _urlInput.value = url
                 }
 
                 if (DirectDownloadEngine.isDirectMediaUrl(url)) {
                     val info = DirectDownloadEngine.inspectMedia(url)
-                    _previewInfo.value = info
+                    _previewInfo.value = info.copy(isPlaylist = false)
                 } else {
-                    val info = YtDlpEngine.fetchVideoInfo(context, url)
-                    _previewInfo.value = info
+                    val info = YtDlpEngine.fetchVideoInfo(
+                        context = context,
+                        rawUrl = url,
+                        forceSingleVideo = true
+                    )
+                    _previewInfo.value = info.copy(isPlaylist = false)
                 }
             } catch (e: Exception) {
                 Log.e("HomeViewModel", "Fallo análisis individual: ${e.message}")
                 try {
                     val fallbackInfo = DirectDownloadEngine.inspectMedia(rawUrl)
-                    _previewInfo.value = fallbackInfo
+                    _previewInfo.value = fallbackInfo.copy(isPlaylist = false)
                 } catch (fallbackEx: Exception) {
                     val isBotBlock = e.message?.contains("bot", ignoreCase = true) == true
                     if (isBotBlock) {
@@ -254,14 +289,17 @@ class HomeViewModel : ViewModel() {
     }
 
     fun startIndividualDownload(context: Context) {
-        val url = _urlInput.value.trim()
-        if (url.isBlank()) return
+        val rawUrl = _urlInput.value.trim()
+        if (rawUrl.isBlank()) return
+
+        val singleUrl = YtDlpEngine.sanitizeSingleVideoUrl(rawUrl)
+        val singlePreview = _previewInfo.value?.copy(isPlaylist = false, url = singleUrl)
 
         DownloadManager.enqueue(
             context = context,
-            url = url,
+            url = singleUrl,
             preset = _selectedPreset.value,
-            preview = _previewInfo.value,
+            preview = singlePreview,
             isPlaylist = false
         )
 
@@ -320,7 +358,7 @@ class HomeViewModel : ViewModel() {
                     _playlistUrlInput.value = url
                 }
 
-                val info = YtDlpEngine.fetchVideoInfo(context, url)
+                val info = YtDlpEngine.fetchVideoInfo(context, url, forceSingleVideo = false)
                 _playlistPreviewInfo.value = info.copy(isPlaylist = true)
             } catch (e: Exception) {
                 Log.e("HomeViewModel", "Fallo análisis de playlist: ${e.message}")
@@ -339,7 +377,7 @@ class HomeViewModel : ViewModel() {
             context = context,
             url = url,
             preset = _playlistPreset.value,
-            preview = _playlistPreviewInfo.value,
+            preview = _playlistPreviewInfo.value?.copy(isPlaylist = true),
             isPlaylist = true
         )
 
@@ -356,9 +394,9 @@ class HomeViewModel : ViewModel() {
 
     fun onSharedUrlReceived(context: Context, rawText: String) {
         val extractedUrl = extractUrl(rawText) ?: rawText.trim()
-        val isPlaylist = YtDlpEngine.isPlaylistUrl(extractedUrl)
+        val isPurePlaylist = YtDlpEngine.isPlaylistUrl(extractedUrl) && YtDlpEngine.extractYouTubeId(extractedUrl) == null
         _currentTab.value = 0
-        if (isPlaylist) {
+        if (isPurePlaylist) {
             _downloadMode.value = 1
             onPlaylistUrlChange(extractedUrl)
             analyzePlaylistUrl(context)
@@ -382,27 +420,25 @@ class HomeViewModel : ViewModel() {
         DownloadManager.retry(context, id)
     }
 
-    fun deleteDownload(id: String, removeFile: Boolean) {
-        DownloadManager.delete(id, removeFile)
+    fun deleteDownload(context: Context, id: String, removeFile: Boolean) {
+        DownloadManager.delete(id, removeFile, context)
     }
 
     fun openFile(context: Context, item: DownloadItem) {
         val path = item.filePath ?: return
-        val file = File(path)
-        FileUtils.openFile(context, file)
+        FileUtils.openMedia(context, path, item.fileName)
     }
 
     fun shareFile(context: Context, item: DownloadItem) {
         val path = item.filePath ?: return
-        val file = File(path)
-        FileUtils.shareFile(context, file)
+        FileUtils.shareMedia(context, path, item.fileName)
     }
 
-    fun refreshLibrary(context: Context) {
+    fun refreshLibrary(context: Context, clearPreviousCompleted: Boolean = false) {
         viewModelScope.launch {
-            DownloadManager.scanLocalFiles(context)
+            DownloadManager.scanLocalFiles(context, clearPreviousCompleted)
             _cookieSummary.value = CookieHelper.getCookieSummary(context)
-            _currentDownloadDir.value = FileUtils.getDownloadDirectory(context).absolutePath
+            _currentDownloadDir.value = FileUtils.getCurrentDestinationLabel(context)
         }
     }
 
@@ -422,6 +458,6 @@ class HomeViewModel : ViewModel() {
     }
 
     fun updateEngineNow() {
-        PowerPapiloApp.instance.updateEngineInBackground()
+        PowerPapiloApp.instance.updateEngineInBackground(force = true)
     }
 }

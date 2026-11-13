@@ -816,7 +816,7 @@ fun DownloaderTab(
                     item = item,
                     onCancel = { viewModel.cancelDownload(item.id) },
                     onRetry = { viewModel.retryDownload(context, item.id) },
-                    onDelete = { viewModel.deleteDownload(item.id, false) },
+                    onDelete = { viewModel.deleteDownload(context, item.id, false) },
                     onLoginYouTube = { viewModel.openYouTubeLogin() }
                 )
             }
@@ -1176,7 +1176,7 @@ fun LibraryTab(
                         item = item,
                         onOpen = { viewModel.openFile(context, item) },
                         onShare = { viewModel.shareFile(context, item) },
-                        onDelete = { viewModel.deleteDownload(item.id, true) }
+                        onDelete = { viewModel.deleteDownload(context, item.id, true) }
                     )
                 }
             }
@@ -1512,122 +1512,4 @@ fun SettingsTab(
             }
         }
     }
-}
-
-@Composable
-fun FolderSelectionDialog(
-    viewModel: HomeViewModel,
-    onDismiss: () -> Unit
-) {
-    val context = LocalContext.current
-    val currentDir by viewModel.currentDownloadDir.collectAsState()
-    val options = remember { viewModel.getFolderOptions(context) }
-    var selectedPath by remember { mutableStateOf(currentDir) }
-    var newFolderName by remember { mutableStateOf("") }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Icon(Icons.Default.FolderOpen, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
-                Text("Elegir Carpeta de Guardado", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold))
-            }
-        },
-        text = {
-            LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                item {
-                    Text(
-                        text = "Selecciona dónde deseas guardar todas tus descargas de video, audio e imágenes:",
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                }
-
-                items(options) { option ->
-                    Surface(
-                        shape = RoundedCornerShape(10.dp),
-                        color = if (selectedPath == option.path) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable { selectedPath = option.path }
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(10.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            RadioButton(
-                                selected = selectedPath == option.path,
-                                onClick = { selectedPath = option.path }
-                            )
-                            Spacer(Modifier.width(6.dp))
-                            Column {
-                                Text(
-                                    text = option.name,
-                                    style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold)
-                                )
-                                Text(
-                                    text = option.description,
-                                    style = MaterialTheme.typography.labelSmall.copy(color = MaterialTheme.colorScheme.outline)
-                                )
-                            }
-                        }
-                    }
-                }
-
-                item {
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        text = "O crear una nueva subcarpeta personalizada:",
-                        style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold)
-                    )
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        OutlinedTextField(
-                            value = newFolderName,
-                            onValueChange = { newFolderName = it },
-                            placeholder = { Text("Ej: Mis Videos") },
-                            modifier = Modifier.weight(1f),
-                            singleLine = true,
-                            shape = RoundedCornerShape(8.dp)
-                        )
-                        Button(
-                            onClick = {
-                                if (newFolderName.isNotBlank()) {
-                                    val success = viewModel.createCustomDestinationFolder(context, newFolderName)
-                                    if (success) {
-                                        onDismiss()
-                                    }
-                                }
-                            },
-                            enabled = newFolderName.isNotBlank()
-                        ) {
-                            Icon(Icons.Default.CreateNewFolder, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(Modifier.width(4.dp))
-                            Text("Crear")
-                        }
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            Button(
-                onClick = {
-                    viewModel.setDestinationFolder(context, selectedPath)
-                    onDismiss()
-                }
-            ) {
-                Text("Guardar Carpeta")
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text("Cancelar")
-            }
-        }
-    )
 }

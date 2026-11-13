@@ -143,4 +143,116 @@ class ExampleRobolectricTest {
         assertNotNull(speed)
         assertEquals("3.45MiB/s", speed?.trim())
     }
+
+    @Test
+    fun `test sanitize single video url strips playlist parameters`() {
+        val mixedUrl = "https://www.youtube.com/watch?v=BX8Dbsa0lB4&list=RDMMBX8Dbsa0lB4&index=2&start_radio=1"
+        val cleaned = YtDlpEngine.sanitizeSingleVideoUrl(mixedUrl)
+        assertEquals("https://www.youtube.com/watch?v=BX8Dbsa0lB4", cleaned)
+
+        val shortUrlWithList = "https://youtu.be/GAeuN6qM_4k?list=PL123456"
+        assertEquals("https://youtu.be/GAeuN6qM_4k", YtDlpEngine.sanitizeSingleVideoUrl(shortUrlWithList))
+
+        val purePlaylist = "https://www.youtube.com/playlist?list=PLrEnWoR732-BHrPp_Pm8_VleD68f9n14-"
+        assertEquals(purePlaylist, YtDlpEngine.sanitizeSingleVideoUrl(purePlaylist))
+    }
+
+    @Test
+    fun `test individual download request never forces playlist even when preview had playlist flag`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val previewWithPlaylist = com.example.data.VideoInfoPreview(
+            url = "https://www.youtube.com/watch?v=BX8Dbsa0lB4&list=PL123",
+            title = "Single Video",
+            isPlaylist = true
+        )
+        val item = com.example.download.DownloadManager.enqueue(
+            context = context,
+            url = "https://www.youtube.com/watch?v=BX8Dbsa0lB4&list=PL123",
+            preset = QualityPreset.BEST,
+            preview = previewWithPlaylist,
+            isPlaylist = false
+        )
+        assertFalse(item.isPlaylist)
+        assertEquals("https://www.youtube.com/watch?v=BX8Dbsa0lB4", item.url)
+
+        val playlistItem = com.example.download.DownloadManager.enqueue(
+            context = context,
+            url = "https://www.youtube.com/playlist?list=PL123",
+            preset = QualityPreset.BEST,
+            preview = previewWithPlaylist,
+            isPlaylist = true
+        )
+        assertTrue(playlistItem.isPlaylist)
+
+        // Cleanup queue items
+        com.example.download.DownloadManager.delete(item.id, false, context)
+        com.example.download.DownloadManager.delete(playlistItem.id, false, context)
+    }
+
+    @Test
+    fun `test navigable local folder creation and listing`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val base = File(context.filesDir, "BrowseRootTest").apply { mkdirs() }
+        val sub = FileUtils.createLocalSubfolder(base.absolutePath, "Musica Rock")
+        assertNotNull(sub)
+        assertTrue(sub!!.exists())
+
+        val listed = FileUtils.listLocalSubfolders(base.absolutePath)
+        assertTrue(listed.any { it.name == "Musica Rock" && it.pathOrDocId == sub.absolutePath })
+
+        base.deleteRecursively()
+    }
+
+    @Test
+    fun `test public downloads and saf tree destination configuration`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val publicOk = FileUtils.setPublicDownloadsDestination(context)
+        assertTrue(publicOk)
+        assertEquals(com.example.util.StorageType.PUBLIC_DOWNLOADS, FileUtils.getStorageType(context))
+
+        val fakeTreeUri = android.net.Uri.parse("content://com.android.externalstorage.documents/tree/1234-5678%3AMisVideos")
+        val safOk = FileUtils.setSafTreeDestination(context, fakeTreeUri)
+        assertTrue(safOk)
+        assertEquals(com.example.util.StorageType.SAF_TREE, FileUtils.getStorageType(context))
+        assertTrue(FileUtils.getCurrentDestinationLabel(context).contains("Memoria SD"))
+    }
+
+    @Test
+    fun `test improved ytdlp and ffmpeg request options for mp3`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val item = com.example.data.DownloadItem(
+            url = "https://www.youtube.com/watch?v=BX8Dbsa0lB4",
+            preset = QualityPreset.AUDIO_MP3,
+            isPlaylist = false
+        )
+        val dir = File(context.filesDir, "Mp3BaseTestDir").apply { mkdirs() }
+
+        val cmd = YtDlpEngine.buildRequest(context, item, dir).buildCommand()
+        assertFalse(cmd.contains("--user-agent"))
+        assertFalse(cmd.contains("--extractor-args"))
+        assertTrue(cmd.contains("--cache-dir"))
+        assertTrue(cmd.contains("--throttled-rate"))
+        assertTrue(cmd.contains("ba/bestaudio/b"))
+        assertTrue(cmd.contains("mp3"))
+        assertTrue(cmd.contains("--audio-quality"))
+        assertTrue(cmd.contains("0"))
+        assertTrue(cmd.contains("--embed-thumbnail"))
+        assertTrue(cmd.contains("--convert-thumbnails"))
+        assertTrue(cmd.contains("jpg"))
+        assertTrue(cmd.contains("ffmpeg:-threads 0"))
+
+        dir.deleteRecursively()
+    }
+
+    @Test
+    fun `test aria2c speed and destination title parsing`() {
+        val ariaLine = "[#1a2b3c 1.5MiB/3.5MiB(42%) CN:8 DL:2.3MiB ETA:0s]"
+        assertEquals("2.3MiB/s", YtDlpEngine.parseSpeed(ariaLine))
+
+        val dlLine = "[download] Destination: /storage/emulated/0/Download/Cancion Ejemplo [BX8Dbsa0lB4].m4a"
+        assertEquals("Cancion Ejemplo", YtDlpEngine.parseDestinationTitle(dlLine))
+
+        val extractLine = "[ExtractAudio] Destination: /data/user/0/com.example/cache/Track Oficial [GAeuN6qM_4k].mp3"
+        assertEquals("Track Oficial", YtDlpEngine.parseDestinationTitle(extractLine))
+    }
 }

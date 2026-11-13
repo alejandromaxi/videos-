@@ -120,6 +120,7 @@ dependencies {
   implementation(libs.converter.moshi)
   implementation(libs.youtubedl.library)
   implementation(libs.youtubedl.ffmpeg)
+  implementation(libs.youtubedl.aria2c)
   // Uncomment to use Firestore:
   // implementation(libs.firebase.firestore)
 

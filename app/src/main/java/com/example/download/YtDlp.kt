@@ -2,6 +2,7 @@ package com.example.download
 
 import android.content.Context
 import android.util.Log
+import com.example.PowerPapiloApp
 import com.example.data.DownloadItem
 import com.example.data.QualityPreset
 import com.example.data.VideoInfoPreview
@@ -77,9 +78,37 @@ object YtDlpEngine {
         return if (matcher.find()) matcher.group(1) else null
     }
 
-    suspend fun fetchVideoInfo(context: Context, rawUrl: String): VideoInfoPreview = withContext(Dispatchers.IO) {
-        val resolvedUrl = resolveRedirectUrl(rawUrl)
-        val isPlaylist = isPlaylistUrl(resolvedUrl)
+    fun sanitizeSingleVideoUrl(url: String): String {
+        val trimmed = url.trim()
+        if (!isYouTubeUrl(trimmed)) return trimmed
+        val hasVideoId = extractYouTubeId(trimmed) != null
+        if (!hasVideoId) return trimmed
+
+        val qIndex = trimmed.indexOf('?')
+        if (qIndex == -1) return trimmed
+
+        val base = trimmed.substring(0, qIndex)
+        val query = trimmed.substring(qIndex + 1)
+        val fragmentIndex = query.indexOf('#')
+        val cleanQuery = if (fragmentIndex != -1) query.substring(0, fragmentIndex) else query
+
+        val filteredParams = cleanQuery.split("&")
+            .filter { param ->
+                val key = param.substringBefore('=').lowercase()
+                key.isNotBlank() && key !in setOf("list", "index", "start_radio", "playnext")
+            }
+
+        return if (filteredParams.isEmpty()) base else "$base?${filteredParams.joinToString("&")}"
+    }
+
+    suspend fun fetchVideoInfo(
+        context: Context,
+        rawUrl: String,
+        forceSingleVideo: Boolean = false
+    ): VideoInfoPreview = withContext(Dispatchers.IO) {
+        val preProcessedUrl = if (forceSingleVideo) sanitizeSingleVideoUrl(rawUrl) else rawUrl
+        val resolvedUrl = resolveRedirectUrl(preProcessedUrl)
+        val isPlaylist = if (forceSingleVideo) false else isPlaylistUrl(resolvedUrl)
 
         // 1. Detección inmediata para YouTube: Nunca llamar a Python en análisis para evitar bloqueos y congelamientos
         if (isYouTubeUrl(resolvedUrl)) {
@@ -190,22 +219,43 @@ object YtDlpEngine {
     }
 
     fun applyBaseOptions(context: Context, request: YoutubeDLRequest) {
-        request.addOption("--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
-        // Opciones estándar para el extractor de YouTube
-        request.addOption("--extractor-args", "youtube:player_client=web,android")
-        request.addOption("--force-ipv4")
-        request.addOption("--geo-bypass")
-        request.addOption("--no-check-certificates")
-
         val cookieFile = CookieHelper.getCookieFile(context)
-        if (cookieFile.exists() && cookieFile.length() > 0) {
+        val hasCookies = cookieFile.exists() && cookieFile.length() > 0
+
+        if (hasCookies) {
             request.addOption("--cookies", cookieFile.absolutePath)
             Log.d(TAG, "Inyectando cookies.txt (${cookieFile.length()} bytes)")
         }
+
+        // Directorio de caché escribible en Android para reutilizar el descifrado de player JS (nsig)
+        val cacheDir = File(context.cacheDir, "ytdlp_cache").apply {
+            if (!exists()) mkdirs()
+        }
+        request.addOption("--cache-dir", cacheDir.absolutePath)
+
+        request.addOption("--force-ipv4")
+        request.addOption("--geo-bypass")
+        request.addOption("--no-check-certificates")
+        request.addOption("--no-warnings")
+        request.addOption("--newline")
+        request.addOption("--socket-timeout", "15")
+        request.addOption("--retries", "3")
+        request.addOption("--fragment-retries", "3")
+        request.addOption("--throttled-rate", "100K")
+
+        if (PowerPapiloApp.isAria2cAvailable.value) {
+            request.addOption("--downloader", "http,https:libaria2c.so")
+            request.addOption(
+                "--external-downloader-args",
+                "aria2c:--summary-interval=1 -x 8 -s 8 -k 1M --file-allocation=none"
+            )
+        }
+        request.addOption("--concurrent-fragments", "4")
     }
 
     fun buildRequest(context: Context, item: DownloadItem, downloadDir: File): YoutubeDLRequest {
-        val request = YoutubeDLRequest(item.url)
+        val targetUrl = if (item.isPlaylist) item.url else sanitizeSingleVideoUrl(item.url)
+        val request = YoutubeDLRequest(targetUrl)
         applyBaseOptions(context, request)
 
         if (item.isPlaylist) {
@@ -214,35 +264,49 @@ object YtDlpEngine {
             request.addOption("-o", outputTemplate)
         } else {
             request.addOption("--no-playlist")
+            request.addOption("--playlist-items", "1")
             val outputTemplate = File(downloadDir, "%(title).80B [%(id)s].%(ext)s").absolutePath
             request.addOption("-o", outputTemplate)
         }
 
         request.addOption("--no-mtime")
-        request.addOption("--add-metadata")
 
         when (item.preset) {
             QualityPreset.BEST -> {
+                request.addOption("--add-metadata")
                 request.addOption("-f", "bv*+ba/b")
+                request.addOption("--ppa", "ffmpeg:-threads 0")
             }
             QualityPreset.P1080 -> {
+                request.addOption("--add-metadata")
                 request.addOption("-f", "bv*[height<=1080]+ba/b[height<=1080]/b")
+                request.addOption("--ppa", "ffmpeg:-threads 0")
             }
             QualityPreset.P720 -> {
+                request.addOption("--add-metadata")
                 request.addOption("-f", "bv*[height<=720]+ba/b[height<=720]/b")
+                request.addOption("--ppa", "ffmpeg:-threads 0")
             }
             QualityPreset.AUDIO_MP3 -> {
+                request.addOption("-f", "ba/bestaudio/b")
                 request.addOption("-x")
                 request.addOption("--audio-format", "mp3")
                 request.addOption("--audio-quality", "0")
+                request.addOption("--add-metadata")
                 request.addOption("--embed-thumbnail")
+                request.addOption("--convert-thumbnails", "jpg")
+                request.addOption("--ppa", "ffmpeg:-threads 0")
             }
             QualityPreset.AUDIO_M4A -> {
+                request.addOption("-f", "ba[ext=m4a]/ba/bestaudio/b")
                 request.addOption("-x")
                 request.addOption("--audio-format", "m4a")
+                request.addOption("--add-metadata")
                 request.addOption("--embed-thumbnail")
+                request.addOption("--convert-thumbnails", "jpg")
             }
             QualityPreset.VIDEO_WEBM -> {
+                request.addOption("--add-metadata")
                 request.addOption("-f", "bv*[ext=webm]+ba*[ext=webm]/b[ext=webm]/best")
             }
             QualityPreset.IMAGE_WEBP -> {
@@ -254,11 +318,31 @@ object YtDlpEngine {
         return request
     }
 
+    private val aria2cSpeedPattern = Pattern.compile("DL:([0-9.]+\\s*[KkMmGg]?i?B)")
+
     fun parseSpeed(logLine: String): String? {
         val matcher = speedPattern.matcher(logLine)
-        return if (matcher.find()) {
-            matcher.group(1)
-        } else null
+        if (matcher.find()) {
+            return matcher.group(1)
+        }
+        val ariaMatcher = aria2cSpeedPattern.matcher(logLine)
+        if (ariaMatcher.find()) {
+            val raw = ariaMatcher.group(1)?.trim() ?: return null
+            return "$raw/s"
+        }
+        return null
+    }
+
+    fun parseDestinationTitle(logLine: String): String? {
+        val marker = "Destination:"
+        val idx = logLine.indexOf(marker)
+        if (idx == -1) return null
+        val rawPath = logLine.substring(idx + marker.length).trim()
+        if (rawPath.isBlank()) return null
+        val fileName = rawPath.substringAfterLast('/').substringAfterLast('\\')
+        val baseName = fileName.substringBeforeLast('.')
+        val cleaned = baseName.replace(Regex("\\s*\\[[A-Za-z0-9_-]{6,15}]$"), "").trim()
+        return cleaned.takeIf { it.isNotBlank() }
     }
 
     fun cancel(processId: String): Boolean {

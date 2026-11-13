@@ -12,6 +12,7 @@ import com.example.data.DownloadStatus
 import com.example.data.QualityPreset
 import com.example.data.VideoInfoPreview
 import com.example.util.FileUtils
+import com.example.util.StorageType
 import com.yausername.youtubedl_android.YoutubeDL
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -57,20 +58,21 @@ object DownloadManager {
         preview: VideoInfoPreview? = null,
         isPlaylist: Boolean = false
     ): DownloadItem {
-        val effectivePlaylist = isPlaylist || (preview?.isPlaylist == true)
-        val defaultTitle = if (effectivePlaylist) "Lista de reproducción en cola..."
+        // Respetar estrictamente el parámetro isPlaylist del apartado elegido (Individual vs Playlist)
+        val cleanUrl = if (isPlaylist) url.trim() else YtDlpEngine.sanitizeSingleVideoUrl(url.trim())
+        val defaultTitle = if (isPlaylist) "Lista de reproducción en cola..."
         else if (preset == QualityPreset.IMAGE_WEBP) "Imagen WEBP en cola..."
         else "Descarga en cola..."
 
         val item = DownloadItem(
-            url = url.trim(),
+            url = cleanUrl,
             title = preview?.title ?: defaultTitle,
             author = preview?.uploader ?: "Iniciando...",
             thumbnailUrl = preview?.thumbnailUrl,
             durationSeconds = preview?.durationSeconds ?: 0L,
             preset = preset,
             status = DownloadStatus.QUEUED,
-            isPlaylist = effectivePlaylist
+            isPlaylist = isPlaylist
         )
 
         _downloads.update { listOf(item) + it }
@@ -108,7 +110,8 @@ object DownloadManager {
     }
 
     private suspend fun processDownload(context: Context, item: DownloadItem) {
-        val downloadDir = FileUtils.getDownloadDirectory(context)
+        val workingDir = FileUtils.getWorkingDirectory(context, item.id)
+        val isLocalMode = FileUtils.getStorageType(context) == StorageType.LOCAL_DIR
         _activeItem.value = item
 
         updateItem(item.id) {
@@ -128,13 +131,29 @@ object DownloadManager {
 
             // 1. Descarga de imagen en formato WEBP
             if (item.preset == QualityPreset.IMAGE_WEBP) {
-                downloadWebpImage(context, item, downloadDir)
+                val webpFile = downloadWebpImage(context, item, workingDir)
+                val exported = FileUtils.exportFilesToDestination(context, listOf(webpFile), workingDir)
+                val result = exported.firstOrNull()
+                updateItem(item.id) {
+                    it.copy(
+                        status = DownloadStatus.COMPLETED,
+                        progress = 100f,
+                        filePath = result?.pathOrUri ?: webpFile.absolutePath,
+                        fileName = result?.fileName ?: webpFile.name,
+                        totalBytes = result?.sizeBytes ?: webpFile.length(),
+                        completedAt = System.currentTimeMillis()
+                    )
+                }
                 scanLocalFiles(context)
                 return
             }
 
             val isDirectMedia = DirectDownloadEngine.isDirectMediaUrl(item.url)
-            val isYtDlpReady = PowerPapiloApp.isYtDlpAvailable.value
+            val isYtDlpReady = if (isDirectMedia) {
+                false
+            } else {
+                PowerPapiloApp.awaitEngineReady()
+            }
 
             if (isDirectMedia || !isYtDlpReady) {
                 if (currentTitle.startsWith("Descarga") || currentTitle.startsWith("Analizando")) {
@@ -158,7 +177,7 @@ object DownloadManager {
 
                 val savedFile = DirectDownloadEngine.downloadDirect(
                     item = item.copy(title = currentTitle),
-                    destinationDir = downloadDir
+                    destinationDir = workingDir
                 ) { progress, eta, speed ->
                     updateItem(item.id) { current ->
                         current.copy(
@@ -170,38 +189,35 @@ object DownloadManager {
                     }
                 }
 
+                val exported = FileUtils.exportFilesToDestination(context, listOf(savedFile), workingDir)
+                val result = exported.firstOrNull()
+
                 updateItem(item.id) {
                     it.copy(
                         status = DownloadStatus.COMPLETED,
                         progress = 100f,
-                        filePath = savedFile.absolutePath,
-                        fileName = savedFile.name,
-                        totalBytes = savedFile.length(),
+                        filePath = result?.pathOrUri ?: savedFile.absolutePath,
+                        fileName = result?.fileName ?: savedFile.name,
+                        totalBytes = result?.sizeBytes ?: savedFile.length(),
                         completedAt = System.currentTimeMillis()
                     )
                 }
-                Log.d(TAG, "Descarga directa completada: ${savedFile.name}")
-                // Actualizar biblioteca de inmediato
+                Log.d(TAG, "Descarga directa completada: ${result?.fileName ?: savedFile.name}")
                 scanLocalFiles(context)
 
             } else {
-                // Descarga mediante motor yt-dlp
-                if (currentTitle.startsWith("Descarga") || currentThumb == null) {
-                    try {
-                        val info = YtDlpEngine.fetchVideoInfo(context, item.url)
-                        currentTitle = info.title
-                        currentAuthor = info.uploader ?: "Desconocido"
-                        currentThumb = info.thumbnailUrl
-                        currentDuration = info.durationSeconds
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Fallo al obtener info previa en proceso: ${e.message}")
+                // Arranque inmediato sin pre-consulta bloqueante (evita 2º arranque de Python / esperas de red)
+                if (currentThumb == null && YtDlpEngine.isYouTubeUrl(item.url)) {
+                    val ytId = YtDlpEngine.extractYouTubeId(item.url)
+                    if (ytId != null) {
+                        currentThumb = "https://i.ytimg.com/vi/$ytId/hqdefault.jpg"
                     }
                 }
 
                 updateItem(item.id) {
                     it.copy(
                         title = currentTitle,
-                        author = currentAuthor,
+                        author = if (currentAuthor == "Iniciando...") "Descargando..." else currentAuthor,
                         thumbnailUrl = currentThumb,
                         durationSeconds = currentDuration,
                         status = DownloadStatus.DOWNLOADING,
@@ -212,19 +228,41 @@ object DownloadManager {
                 val request = YtDlpEngine.buildRequest(
                     context = context,
                     item = item.copy(title = currentTitle),
-                    downloadDir = downloadDir
+                    downloadDir = workingDir
                 )
 
-                val filesBefore = downloadDir.walkTopDown().filter { it.isFile }.toSet()
+                val filesBefore = if (isLocalMode) {
+                    workingDir.walkTopDown().filter { it.isFile }.toSet()
+                } else {
+                    emptySet()
+                }
 
                 YoutubeDL.getInstance().execute(request, item.id) { progress, etaInSeconds, line ->
                     val speed = YtDlpEngine.parseSpeed(line)
+                    val detectedTitle = YtDlpEngine.parseDestinationTitle(line)
+                    val isConvertingPhase = !line.startsWith("[download]") && (
+                        line.contains("ExtractAudio") ||
+                            line.contains("ffmpeg", ignoreCase = true) ||
+                            line.contains("EmbedThumbnail") ||
+                            line.contains("Metadata") ||
+                            line.contains("Merger")
+                        )
+
                     updateItem(item.id) { current ->
+                        val updatedTitle = if (
+                            detectedTitle != null &&
+                            (current.title.startsWith("Descarga") || current.title.startsWith("Lista de reproducción"))
+                        ) {
+                            detectedTitle
+                        } else {
+                            current.title
+                        }
                         current.copy(
+                            title = updatedTitle,
                             progress = progress,
                             etaSeconds = etaInSeconds,
                             downloadSpeed = speed ?: current.downloadSpeed,
-                            status = if (line.contains("ExtractAudio") || line.contains("ffmpeg") || line.contains("Destination")) {
+                            status = if (isConvertingPhase) {
                                 DownloadStatus.CONVERTING
                             } else {
                                 DownloadStatus.DOWNLOADING
@@ -233,41 +271,61 @@ object DownloadManager {
                     }
                 }
 
-                val filesAfter = downloadDir.walkTopDown().filter { it.isFile }.toSet()
-                val newFiles = filesAfter - filesBefore
-                val targetFile = newFiles.maxByOrNull { it.lastModified() }
-                    ?: downloadDir.walkTopDown().filter { it.isFile && it.lastModified() >= startTime }.maxByOrNull { it.lastModified() }
-                    ?: downloadDir.listFiles()?.maxByOrNull { it.lastModified() }
+                val filesAfter = workingDir.walkTopDown().filter { it.isFile && it.length() > 0 }.toSet()
+                val newFiles = (filesAfter - filesBefore).ifEmpty {
+                    workingDir.walkTopDown()
+                        .filter { it.isFile && it.length() > 0 && it.lastModified() >= startTime }
+                        .toList()
+                }.toList()
 
-                val finalTotalBytes = if (item.isPlaylist && newFiles.isNotEmpty()) {
-                    newFiles.sumOf { it.length() }
+                val exported = FileUtils.exportFilesToDestination(context, newFiles, workingDir)
+                val primaryResult = exported.maxByOrNull { it.lastModified }
+
+                val finalTotalBytes = if (item.isPlaylist && exported.isNotEmpty()) {
+                    exported.sumOf { it.sizeBytes }
                 } else {
-                    targetFile?.length() ?: 0L
+                    primaryResult?.sizeBytes ?: 0L
                 }
 
-                val finalFileName = if (item.isPlaylist && newFiles.size > 1) {
-                    "${currentTitle} (${newFiles.size} archivos)"
+                val finalFileName = if (item.isPlaylist && exported.size > 1) {
+                    "$currentTitle (${exported.size} archivos)"
                 } else {
-                    targetFile?.name ?: "video_${item.id.take(8)}"
+                    primaryResult?.fileName ?: "video_${item.id.take(8)}"
                 }
 
-                updateItem(item.id) {
-                    it.copy(
+                updateItem(item.id) { current ->
+                    val finalTitle = if (
+                        primaryResult != null &&
+                        (current.title.startsWith("Descarga") || current.title.startsWith("Lista de reproducción"))
+                    ) {
+                        primaryResult.fileName.substringBeforeLast('.').ifBlank { current.title }
+                    } else {
+                        current.title
+                    }
+                    current.copy(
+                        title = finalTitle,
                         status = DownloadStatus.COMPLETED,
                         progress = 100f,
-                        filePath = targetFile?.absolutePath,
+                        filePath = primaryResult?.pathOrUri,
                         fileName = finalFileName,
                         totalBytes = finalTotalBytes,
                         completedAt = System.currentTimeMillis()
                     )
                 }
 
-                // Actualizar biblioteca de inmediato cada vez que algo se descarga
                 scanLocalFiles(context)
             }
 
         } catch (e: Exception) {
             Log.e(TAG, "Fallo en descarga ${item.id}: ${e.message}", e)
+            // Limpiar staging en caso de fallo si no es modo local
+            if (!isLocalMode) {
+                try {
+                    workingDir.deleteRecursively()
+                } catch (_: Exception) {
+                }
+            }
+
             val isCancelled = e.message?.contains("destroy", ignoreCase = true) == true ||
                     e is YoutubeDL.CanceledException ||
                     e.message?.contains("Canceled", ignoreCase = true) == true
@@ -294,7 +352,7 @@ object DownloadManager {
         }
     }
 
-    private suspend fun downloadWebpImage(context: Context, item: DownloadItem, downloadDir: File) = withContext(Dispatchers.IO) {
+    private suspend fun downloadWebpImage(context: Context, item: DownloadItem, workingDir: File): File = withContext(Dispatchers.IO) {
         updateItem(item.id) {
             it.copy(
                 status = DownloadStatus.DOWNLOADING,
@@ -305,14 +363,13 @@ object DownloadManager {
         var imageUrl = item.thumbnailUrl
         var videoTitle = item.title
 
-        // Si no tenemos URL de miniatura, resolverla
         if (imageUrl.isNullOrBlank()) {
             val ytId = YtDlpEngine.extractYouTubeId(item.url)
             imageUrl = if (ytId != null) {
                 "https://i.ytimg.com/vi/$ytId/maxresdefault.jpg"
             } else {
                 try {
-                    val info = YtDlpEngine.fetchVideoInfo(context, item.url)
+                    val info = YtDlpEngine.fetchVideoInfo(context, item.url, forceSingleVideo = !item.isPlaylist)
                     videoTitle = info.title
                     info.thumbnailUrl
                 } catch (e: Exception) {
@@ -331,30 +388,30 @@ object DownloadManager {
             .build()
 
         val response = imageHttpClient.newCall(request).execute()
-        if (!response.isSuccessful && imageUrl.contains("maxresdefault.jpg")) {
-            // Reintentar con hqdefault.jpg
+        val bytes: ByteArray = if (!response.isSuccessful && imageUrl.contains("maxresdefault.jpg")) {
+            response.close()
             val fallbackUrl = imageUrl.replace("maxresdefault.jpg", "hqdefault.jpg")
             val fallbackReq = Request.Builder().url(fallbackUrl).build()
             imageHttpClient.newCall(fallbackReq).execute().use { fbRes ->
                 if (!fbRes.isSuccessful) throw IllegalStateException("Error al descargar miniatura (${fbRes.code})")
-                val bytes = fbRes.body?.bytes() ?: throw IllegalStateException("Cuerpo de imagen vacío")
-                saveBytesAsWebp(bytes, videoTitle, downloadDir, item)
+                fbRes.body?.bytes() ?: throw IllegalStateException("Cuerpo de imagen vacío")
             }
         } else {
             response.use { res ->
                 if (!res.isSuccessful) throw IllegalStateException("Error al descargar imagen (${res.code})")
-                val bytes = res.body?.bytes() ?: throw IllegalStateException("Cuerpo de imagen vacío")
-                saveBytesAsWebp(bytes, videoTitle, downloadDir, item)
+                res.body?.bytes() ?: throw IllegalStateException("Cuerpo de imagen vacío")
             }
         }
+
+        saveBytesAsWebp(bytes, videoTitle, workingDir, item)
     }
 
-    private fun saveBytesAsWebp(bytes: ByteArray, title: String, downloadDir: File, item: DownloadItem) {
+    private fun saveBytesAsWebp(bytes: ByteArray, title: String, destinationDir: File, item: DownloadItem): File {
         val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
             ?: throw IllegalStateException("Formato de imagen inválido")
 
-        val sanitizedTitle = title.replace(Regex("[^a-zA-Z0-9_\\- .]"), "_").take(70)
-        val targetFile = File(downloadDir, "$sanitizedTitle [${item.id.take(6)}].webp")
+        val sanitizedTitle = title.replace(Regex("[^a-zA-Z0-9_\\- .]"), "_").take(70).ifBlank { "imagen" }
+        val targetFile = File(destinationDir, "$sanitizedTitle [${item.id.take(6)}].webp")
 
         FileOutputStream(targetFile).use { out ->
             val format = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -365,18 +422,8 @@ object DownloadManager {
             }
             bitmap.compress(format, 95, out)
         }
-
-        updateItem(item.id) {
-            it.copy(
-                status = DownloadStatus.COMPLETED,
-                progress = 100f,
-                filePath = targetFile.absolutePath,
-                fileName = targetFile.name,
-                totalBytes = targetFile.length(),
-                completedAt = System.currentTimeMillis()
-            )
-        }
-        Log.d(TAG, "Imagen WEBP guardada exitosamente: ${targetFile.absolutePath}")
+        Log.d(TAG, "Imagen WEBP creada en staging/destino: ${targetFile.absolutePath}")
+        return targetFile
     }
 
     fun cancel(id: String) {
@@ -419,16 +466,19 @@ object DownloadManager {
         }
     }
 
-    fun delete(id: String, deleteFromDisk: Boolean) {
+    fun delete(id: String, deleteFromDisk: Boolean, context: Context? = null) {
         val item = _downloads.value.find { it.id == id }
-        if (deleteFromDisk && item?.filePath != null) {
-            try {
-                val file = File(item.filePath)
-                if (file.exists()) {
-                    file.delete()
+        if (deleteFromDisk && !item?.filePath.isNullOrBlank()) {
+            val ctx = context ?: runCatching { PowerPapiloApp.instance }.getOrNull()
+            if (ctx != null) {
+                FileUtils.deleteMedia(ctx, item!!.filePath!!)
+            } else {
+                try {
+                    val file = File(item!!.filePath!!)
+                    if (file.exists()) file.delete()
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error eliminando archivo: ${e.message}")
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Error eliminando archivo: ${e.message}")
             }
         }
         _downloads.update { list -> list.filterNot { it.id == id } }
@@ -448,35 +498,43 @@ object DownloadManager {
         }
     }
 
-    suspend fun scanLocalFiles(context: Context) = withContext(Dispatchers.IO) {
-        val dir = FileUtils.getDownloadDirectory(context)
-        val files = dir.walkTopDown().filter { it.isFile && it.length() > 0 }.toList()
-        val existingPaths = _downloads.value.mapNotNull { it.filePath }.toSet()
+    suspend fun scanLocalFiles(context: Context, clearPreviousCompleted: Boolean = false) = withContext(Dispatchers.IO) {
+        val scannedResults = FileUtils.scanDestinationFiles(context)
 
-        val scannedItems = files.filter { !existingPaths.contains(it.absolutePath) }
-            .sortedByDescending { it.lastModified() }
-            .map { file ->
-                val isAudio = file.extension.lowercase() in listOf("mp3", "m4a", "opus", "wav", "flac")
-                val isWebp = file.extension.lowercase() == "webp"
-                DownloadItem(
-                    url = file.name,
-                    title = file.nameWithoutExtension,
-                    author = "Descargado en POWER PAPILO",
-                    status = DownloadStatus.COMPLETED,
-                    progress = 100f,
-                    filePath = file.absolutePath,
-                    fileName = file.name,
-                    totalBytes = file.length(),
-                    preset = if (isWebp) QualityPreset.IMAGE_WEBP else if (isAudio) QualityPreset.AUDIO_MP3 else QualityPreset.BEST,
-                    completedAt = file.lastModified()
-                )
+        _downloads.update { current ->
+            val nonCompleted = current.filter { it.status != DownloadStatus.COMPLETED }
+            val existingCompleted = if (clearPreviousCompleted) {
+                emptyList()
+            } else {
+                current.filter { it.status == DownloadStatus.COMPLETED }
             }
 
-        if (scannedItems.isNotEmpty()) {
-            _downloads.update { current ->
-                val combined = current + scannedItems
-                combined.distinctBy { it.filePath ?: it.id }
-            }
+            val existingPaths = existingCompleted.mapNotNull { it.filePath }.toSet()
+
+            val newItems = scannedResults
+                .filter { !existingPaths.contains(it.pathOrUri) }
+                .map { res ->
+                    val ext = res.fileName.substringAfterLast('.', "").lowercase()
+                    val isAudio = ext in listOf("mp3", "m4a", "opus", "wav", "flac")
+                    val isWebp = ext == "webp"
+                    DownloadItem(
+                        url = res.fileName,
+                        title = res.fileName.substringBeforeLast('.').ifBlank { res.fileName },
+                        author = "Descargado en POWER PAPILO",
+                        status = DownloadStatus.COMPLETED,
+                        progress = 100f,
+                        filePath = res.pathOrUri,
+                        fileName = res.fileName,
+                        totalBytes = res.sizeBytes,
+                        preset = if (isWebp) QualityPreset.IMAGE_WEBP else if (isAudio) QualityPreset.AUDIO_MP3 else QualityPreset.BEST,
+                        completedAt = res.lastModified
+                    )
+                }
+
+            val mergedCompleted = (existingCompleted + newItems)
+                .distinctBy { it.filePath ?: it.id }
+
+            nonCompleted + mergedCompleted
         }
     }
 }
